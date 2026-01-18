@@ -1,9 +1,10 @@
 import pygame
 import sys
+import os
 import time
 import random
 import re
-import math
+import noise
 from collections import deque
 from openpyxl import load_workbook
 from routing import Label, Ship, pareto_optimal_path, reconstruct_path, prune_path
@@ -68,6 +69,13 @@ except pygame.error as e:
 
 # Grid spacing constant
 GRID_SPACING = 25
+
+# Noise parameters for environmental variation
+NOISE_SCALE = 200.0  # Controls the "zoom" of the noise (higher = larger features)
+NOISE_OCTAVES = 4
+NOISE_PERSISTENCE = 0.5
+NOISE_LACUNARITY = 2.0
+NOISE_SEED = random.randint(0, 1000) # Random seed for each run
 
 # GridCell class to store base properties of a grid square
 class GridCell:
@@ -148,17 +156,31 @@ def analyze_cell_from_image(cell_x, cell_y, grid_spacing, pixel_array=None):
     ice_ratio = 1.0 - water_ratio
     avg_brightness = total_brightness / total_samples
     
-    # Risk: base risk from ice, plus brightness bonus for thick ice, plus significant independent randomness
-    risk = ice_ratio * 5.0 + (avg_brightness / 255.0) * 2.0 + random.uniform(0, 10.0)
+    # Noise coordinates for spatially coherent randomness
+    nx = cell_x / NOISE_SCALE
+    ny = cell_y / NOISE_SCALE
     
-    # Time multiplier: base ice delay plus significant independent randomness
-    time_mult = 1.0 + ice_ratio * 5.0 + random.uniform(0, 10.0)
+    def get_noise_val(ox, oy, scale):
+        # pnoise2 returns values roughly in [-0.5, 0.5], map to [0, 1]
+        n_val = noise.pnoise2(nx + ox, ny + oy, 
+                              octaves=NOISE_OCTAVES, 
+                              persistence=NOISE_PERSISTENCE, 
+                              lacunarity=NOISE_LACUNARITY, 
+                              base=NOISE_SEED)
+        # Normalize and scale
+        return max(0, (n_val + 0.5)) * scale
+
+    # Risk: base risk from ice, plus brightness bonus for thick ice, plus noise
+    risk = ice_ratio * 5.0 + (avg_brightness / 255.0) * 2.0 + get_noise_val(0, 0, 10.0)
     
-    # Fuel multiplier: base ice drag plus significant independent randomness
-    fuel_mult = 1.0 + ice_ratio * 3.0 + random.uniform(0, 7.0)
+    # Time multiplier: base ice delay plus noise
+    time_mult = 1.0 + ice_ratio * 5.0 + get_noise_val(100.0, 100.0, 10.0)
     
-    # Weather: simulated as a combination of ice and randomness
-    weather = 1.0 + ice_ratio * 2.0 + random.uniform(0, 5.0)
+    # Fuel multiplier: base ice drag plus noise
+    fuel_mult = 1.0 + ice_ratio * 3.0 + get_noise_val(200.0, 200.0, 7.0)
+    
+    # Weather: simulated as a combination of ice and noise
+    weather = 1.0 + ice_ratio * 2.0 + get_noise_val(300.0, 300.0, 5.0)
     
     # Determine if clickable: show grid if majority of sampled points are water
     # Stricter threshold to avoid pathfinding through land edges
@@ -321,7 +343,8 @@ def load_ships_data():
             4: header_row[4].value.strip() if header_row[4].value else None,  # Fuel Consumption
             6: header_row[6].value.strip() if header_row[6].value else None,  # Speed
             7: header_row[7].value.strip() if header_row[7].value else None,  # Durability
-            9: header_row[9].value.strip() if header_row[9].value else None   # Durability Rating
+            9: header_row[9].value.strip() if header_row[9].value else None,  # Durability Rating
+            11: header_row[11].value.strip() if len(header_row) > 11 and header_row[11].value else None  # Image prefix
         }
         
         # Read ship data dynamically
@@ -345,6 +368,8 @@ def load_ships_data():
                 ship_data[headers[7]] = str(row[7].value).strip()
             if row[9].value is not None:  # Durability Rating (can be a number)
                 ship_data[headers[9]] = str(row[9].value).strip()
+            if len(row) > 11 and row[11].value:  # Image prefix
+                ship_data['img_prefix'] = str(row[11].value).strip()
             
             if ship_data:  # Only add if we have data
                 # Convert to a Ship object for the routing algorithm if all required fields are present
@@ -437,6 +462,19 @@ def draw_text_wrapped(surface, text, font, color, rect, aa=True):
         text_surface = font.render(line, aa, color)
         surface.blit(text_surface, (rect.x, rect.y + y_offset))
         y_offset += font.get_height() + 2
+
+# Helper function to load ship image
+def load_ship_image(prefix):
+    if not prefix:
+        return None
+    for ext in ['.png', '.jpg', '.jpeg']:
+        path = f"visuals/{prefix}{ext}"
+        if os.path.exists(path):
+            try:
+                return pygame.image.load(path)
+            except pygame.error:
+                continue
+    return None
 
 # Helper function to format ship description
 def format_ship_description(ship):
@@ -782,27 +820,37 @@ while running:
             title_text = font_large.render("Ship Details", True, BLACK)
             screen.blit(title_text, (panel_x + 10, panel_y + 10))
             
-            # Draw ship image (placeholder)
-            image_size = 150
-            image_x = panel_x + 10
-            image_y = panel_y + 50
-            if ship_placeholder_img:
-                # Scale image to fit
-                img_width, img_height = ship_placeholder_img.get_size()
+            # Draw ship Details text first (on the left now)
+            desc_x = panel_x + 20
+            desc_y = panel_y + 60
+            # Increase image size significantly
+            image_size = min(panel_width // 2, panel_height - 120)
+            desc_width = panel_width - image_size - 60
+            desc_height = panel_height - 120
+            desc_rect = pygame.Rect(desc_x, desc_y, desc_width, desc_height)
+            draw_ship_description(screen, selected_ship, font_medium, font_small, BLACK, desc_rect)
+
+            # Draw ship image (now on the right and larger)
+            image_x = panel_x + panel_width - image_size - 20
+            image_y = panel_y + 60
+            
+            # Try to load ship-specific image, fallback to placeholder
+            ship_img = load_ship_image(selected_ship.get('img_prefix'))
+            if not ship_img:
+                ship_img = ship_placeholder_img
+                
+            if ship_img:
+                # Scale image to fit the larger size
+                img_width, img_height = ship_img.get_size()
                 scale = min(image_size / img_width, image_size / img_height)
                 scaled_width = int(img_width * scale)
                 scaled_height = int(img_height * scale)
-                scaled_img = pygame.transform.scale(ship_placeholder_img, (scaled_width, scaled_height))
-                screen.blit(scaled_img, (image_x, image_y))
-            
-            # Draw ship description (leave space for image and button at bottom)
-            # Position text to the right of the image, or below if image is wide
-            desc_x = panel_x + 10 + image_size + 10
-            desc_y = panel_y + 50
-            desc_width = panel_width - 20 - image_size - 10
-            desc_height = panel_height - 70
-            desc_rect = pygame.Rect(desc_x, desc_y, desc_width, desc_height)
-            draw_ship_description(screen, selected_ship, font_medium, font_small, BLACK, desc_rect)
+                scaled_img = pygame.transform.scale(ship_img, (scaled_width, scaled_height))
+                
+                # Center image in its allocated space
+                final_image_x = image_x + (image_size - scaled_width) // 2
+                final_image_y = image_y + (image_size - scaled_height) // 2
+                screen.blit(scaled_img, (final_image_x, final_image_y))
 
             # Draw green confirmation button in bottom right of description panel
             button_width = 180
