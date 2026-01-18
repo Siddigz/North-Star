@@ -4,10 +4,43 @@ import os
 import time
 import random
 import re
+import math
+import json
 import noise
 from collections import deque
 from openpyxl import load_workbook
 from routing import Label, Ship, pareto_optimal_path, reconstruct_path, prune_path
+
+try:
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+    # Make Matplotlib windows responsive while Pygame owns the main loop.
+    # We'll pump Matplotlib GUI events with a tiny pause each frame.
+    plt.ion()
+except Exception:
+    plt = None
+    _HAS_MPL = False
+
+# region agent log
+_DBG_LOG_PATH = r"d:\Code\North-Star\.cursor\debug.log"
+_DBG_RUN_ID = "run1"
+
+def _dbg_log(hypothesisId, location, message, data=None):
+    try:
+        payload = {
+            "sessionId": "debug-session",
+            "runId": _DBG_RUN_ID,
+            "hypothesisId": hypothesisId,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_DBG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+# endregion
 
 # Initialize Pygame
 pygame.init()
@@ -27,6 +60,56 @@ pygame.display.set_caption("Ship Selection")
 
 # Set up clock for smooth animation
 clock = pygame.time.Clock()
+
+# region agent log
+def _get_window_sizes(screen_surf):
+    try:
+        win = pygame.display.get_window_size()
+    except Exception:
+        win = None
+    try:
+        surf = screen_surf.get_size()
+    except Exception:
+        surf = None
+    hwnd = None
+    rect = None
+    dpi = None
+    try:
+        info = pygame.display.get_wm_info()
+        hwnd = info.get("window")
+    except Exception:
+        hwnd = None
+    try:
+        if hwnd:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG), ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+            r = RECT()
+            if user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(r)):
+                rect = [int(r.left), int(r.top), int(r.right), int(r.bottom)]
+            try:
+                dpi = int(user32.GetDpiForWindow(wintypes.HWND(hwnd)))
+            except Exception:
+                dpi = None
+    except Exception:
+        rect = rect
+        dpi = dpi
+    return {"window": win, "surface": surf, "hwnd": hwnd, "rect": rect, "dpi": dpi}
+
+_last_sizes = None
+_dbg_log(
+    "A",
+    "main.py:init",
+    "pygame initialized",
+    {
+        "init_width_height": (width, height),
+        "sizes": _get_window_sizes(screen),
+        "driver": pygame.display.get_driver() if hasattr(pygame.display, "get_driver") else None,
+    },
+)
+# endregion
 
 # Define colors
 WHITE = (255, 255, 255)
@@ -410,7 +493,7 @@ point_b = None  # Store point B position
 points_confirmed = False  # Track if points A and B have been confirmed
 toggle_on = False  # Toggle button state
 grid_cells = None  # 2D grid of GridCell instances for each grid square
-available_paths = {'time': None, 'fuel': None, 'risk': None}  # Dictionary to store optimized paths
+available_paths = {'time': None, 'fuel': None, 'risk': None, 'optimal': None}  # Dictionary to store optimized paths
 selected_path_type = 'time'  # Currently selected path type
 animation_progress = 1.0  # Path drawing animation progress (0.0 to 1.0)
 selected_grid_layer = 'none'  # Grid visualization layer: 'none', 'risk', 'time', 'fuel'
@@ -431,6 +514,152 @@ def get_value_color(value, min_val, max_val):
     g = int(255 * (1 - t))
     b = 0
     return (r, g, b, 128)
+
+def choose_compromise_label(pareto_labels, w_time=1.0, w_fuel=1.0, w_risk=1.0):
+    """
+    Choose a single "most optimal" (balanced) path from a Pareto set.
+    Method: normalized weighted distance to the utopia point (min time/fuel/risk).
+    """
+    if not pareto_labels:
+        return None
+
+    min_t = min(l.time for l in pareto_labels)
+    min_f = min(l.fuel for l in pareto_labels)
+    min_r = min(l.risk for l in pareto_labels)
+
+    max_t = max(l.time for l in pareto_labels)
+    max_f = max(l.fuel for l in pareto_labels)
+    max_r = max(l.risk for l in pareto_labels)
+
+    dt = max(1e-9, max_t - min_t)
+    df = max(1e-9, max_f - min_f)
+    dr = max(1e-9, max_r - min_r)
+
+    best = None
+    best_score = float("inf")
+
+    for l in pareto_labels:
+        nt = (l.time - min_t) / dt
+        nf = (l.fuel - min_f) / df
+        nr = (l.risk - min_r) / dr
+
+        # L2 distance to utopia (0,0,0) with weights
+        score = (w_time * nt) ** 2 + (w_fuel * nf) ** 2 + (w_risk * nr) ** 2
+
+        if score < best_score:
+            best_score = score
+            best = l
+
+    return best
+
+def _point_to_segment_distance(px, py, ax, ay, bx, by):
+    """
+    Minimum Euclidean distance from point P(px,py) to segment AB.
+    """
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+
+    denom = abx * abx + aby * aby
+    if denom <= 1e-12:
+        return math.hypot(px - ax, py - ay)
+
+    t = (apx * abx + apy * aby) / denom
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+
+    cx = ax + t * abx
+    cy = ay + t * aby
+    return math.hypot(px - cx, py - cy)
+
+def _is_click_near_polyline(click_pos, points, threshold_px=12.0):
+    """
+    Returns True if click is within threshold distance of any segment in the polyline.
+    """
+    if not points or len(points) < 2:
+        return False
+
+    px, py = click_pos
+    for i in range(len(points) - 1):
+        ax, ay = points[i]
+        bx, by = points[i + 1]
+        if _point_to_segment_distance(px, py, ax, ay, bx, by) <= threshold_px:
+            return True
+    return False
+
+def show_path_metrics_bargraph(path_type, path_data, ship_name=None):
+    """
+    Opens a new Matplotlib window showing a bar graph for (time, fuel, risk) for a path.
+    Non-blocking to keep the Pygame loop responsive.
+    """
+    # region agent log
+    _dbg_log(
+        "B",
+        "main.py:show_path_metrics_bargraph:entry",
+        "opening metrics chart",
+        {
+            "path_type": path_type,
+            "has_mpl": _HAS_MPL,
+            "backend": (plt.get_backend() if _HAS_MPL and plt else None),
+            "metrics": {
+                "time": path_data.get("time") if path_data else None,
+                "fuel": path_data.get("fuel") if path_data else None,
+                "risk": path_data.get("risk") if path_data else None,
+            },
+        },
+    )
+    # endregion
+    if not _HAS_MPL:
+        print("Matplotlib is not installed. Run: pip install matplotlib")
+        return
+    if not path_data:
+        return
+
+    labels = ["Time (h)", "Fuel (T)", "Risk (R)"]
+    values = [
+        float(path_data.get("time", 0.0)),
+        float(path_data.get("fuel", 0.0)),
+        float(path_data.get("risk", 0.0)),
+    ]
+
+    palette = {
+        "time": (0.2, 0.8, 0.2),
+        "fuel": (0.39, 0.59, 1.0),
+        "risk": (1.0, 0.65, 0.0),
+        "optimal": (0.63, 0.24, 0.86),
+    }
+    base = palette.get(path_type, (0.5, 0.5, 0.5))
+
+    title = f"{ship_name + ' — ' if ship_name else ''}{path_type.capitalize()} Route Metrics"
+
+    fig, ax = plt.subplots(figsize=(6.0, 4.0))
+    bars = ax.bar(labels, values, color=[base, base, base])
+    ax.set_title(title)
+    ax.set_ylabel("Value")
+    ax.grid(axis="y", alpha=0.3)
+
+    for b, v in zip(bars, values):
+        ax.text(
+            b.get_x() + b.get_width() / 2.0,
+            b.get_height(),
+            f"{v:.2f}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+
+    fig.tight_layout()
+
+    try:
+        fig.canvas.manager.set_window_title(title)
+    except Exception:
+        pass
+
+    plt.show(block=False)
+    plt.pause(0.001)
+    # region agent log
+    _dbg_log("B", "main.py:show_path_metrics_bargraph:exit", "chart shown", {"title": title})
+    # endregion
 
 # Font setup
 font_large = pygame.font.Font(None, 36)
@@ -572,7 +801,7 @@ while running:
                 toggle_on = False
                 selected_grid_layer = 'none'
                 grid_cells = None
-                available_paths = {'time': None, 'fuel': None, 'risk': None}
+                available_paths = {'time': None, 'fuel': None, 'risk': None, 'optimal': None}
                 selected_path_type = 'time'
                 animation_progress = 1.0
         elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -638,10 +867,11 @@ while running:
                     route_btn_w = 200
                     route_btn_h = 45
                     route_btn_x = 10
-                    route_btn_y_start = height - (route_btn_h + 10) * 3 - 10
-                    fastest_rect = pygame.Rect(route_btn_x, route_btn_y_start, route_btn_w, route_btn_h)
-                    eco_rect = pygame.Rect(route_btn_x, route_btn_y_start + route_btn_h + 10, route_btn_w, route_btn_h)
-                    safest_rect = pygame.Rect(route_btn_x, route_btn_y_start + (route_btn_h + 10) * 2, route_btn_w, route_btn_h)
+                    route_btn_y_start = height - (route_btn_h + 10) * 4 - 10
+                    optimal_rect = pygame.Rect(route_btn_x, route_btn_y_start, route_btn_w, route_btn_h)
+                    fastest_rect = pygame.Rect(route_btn_x, route_btn_y_start + (route_btn_h + 10) * 1, route_btn_w, route_btn_h)
+                    eco_rect = pygame.Rect(route_btn_x, route_btn_y_start + (route_btn_h + 10) * 2, route_btn_w, route_btn_h)
+                    safest_rect = pygame.Rect(route_btn_x, route_btn_y_start + (route_btn_h + 10) * 3, route_btn_w, route_btn_h)
                     
                     # Map Confirm button
                     confirm_btn_w = 150
@@ -664,7 +894,11 @@ while running:
                     elif toggle_on and risk_rect.collidepoint(mouse_x, mouse_y):
                         selected_grid_layer = 'risk' if selected_grid_layer != 'risk' else 'none'
                     elif points_confirmed and any(available_paths.values()):
-                        if fastest_rect.collidepoint(mouse_x, mouse_y):
+                        if optimal_rect.collidepoint(mouse_x, mouse_y):
+                            if selected_path_type != 'optimal' and available_paths.get('optimal'):
+                                selected_path_type = 'optimal'
+                                animation_progress = 0.0
+                        elif fastest_rect.collidepoint(mouse_x, mouse_y):
                             if selected_path_type != 'time':
                                 selected_path_type = 'time'
                                 animation_progress = 0.0
@@ -676,6 +910,36 @@ while running:
                             if selected_path_type != 'risk':
                                 selected_path_type = 'risk'
                                 animation_progress = 0.0
+                        else:
+                            # Clicked on the map while routes exist: if user clicked near the displayed route,
+                            # open a Matplotlib bar chart comparing time/fuel/risk for that route.
+                            path_data = available_paths.get(selected_path_type)
+                            if path_data and path_data.get('points'):
+                                if _is_click_near_polyline((mouse_x, mouse_y), path_data['points'], threshold_px=12.0):
+                                    # region agent log
+                                    _dbg_log(
+                                        "C",
+                                        "main.py:click:route_chart",
+                                        "clicked near route polyline",
+                                        {
+                                            "selected_path_type": selected_path_type,
+                                            "mouse": (mouse_x, mouse_y),
+                                            "sizes_before": _get_window_sizes(screen),
+                                        },
+                                    )
+                                    # endregion
+                                    ship_name = None
+                                    if confirmed_ship:
+                                        ship_name = confirmed_ship.get('Ship name')
+                                    show_path_metrics_bargraph(selected_path_type, path_data, ship_name=ship_name)
+                                    # region agent log
+                                    _dbg_log(
+                                        "C",
+                                        "main.py:click:route_chart:after",
+                                        "returned from show_path_metrics_bargraph",
+                                        {"sizes_after": _get_window_sizes(screen)},
+                                    )
+                                    # endregion
                     elif not points_confirmed:
                         if point_a and point_b and map_confirm_rect.collidepoint(mouse_x, mouse_y):
                             # Visual feedback for processing
@@ -700,21 +964,63 @@ while running:
                                     time_label = min(pareto_labels, key=lambda l: l.time)
                                     fuel_label = min(pareto_labels, key=lambda l: l.fuel)
                                     risk_label = min(pareto_labels, key=lambda l: l.risk)
-                                    available_paths['time'] = {'points': get_final_path_points(time_label, grid_cells, point_a, point_b, goal_node, grid_spacing), 'time': time_label.time, 'fuel': time_label.fuel, 'risk': time_label.risk}
-                                    available_paths['fuel'] = {'points': get_final_path_points(fuel_label, grid_cells, point_a, point_b, goal_node, grid_spacing), 'time': fuel_label.time, 'fuel': fuel_label.fuel, 'risk': fuel_label.risk}
-                                    available_paths['risk'] = {'points': get_final_path_points(risk_label, grid_cells, point_a, point_b, goal_node, grid_spacing), 'time': risk_label.time, 'fuel': risk_label.fuel, 'risk': risk_label.risk}
-                                    selected_path_type = 'time'
+                                    optimal_label = choose_compromise_label(pareto_labels, w_time=1.0, w_fuel=1.0, w_risk=1.0)
+
+                                    available_paths['time'] = {
+                                        'points': get_final_path_points(time_label, grid_cells, point_a, point_b, goal_node, grid_spacing),
+                                        'time': time_label.time,
+                                        'fuel': time_label.fuel,
+                                        'risk': time_label.risk
+                                    }
+                                    available_paths['fuel'] = {
+                                        'points': get_final_path_points(fuel_label, grid_cells, point_a, point_b, goal_node, grid_spacing),
+                                        'time': fuel_label.time,
+                                        'fuel': fuel_label.fuel,
+                                        'risk': fuel_label.risk
+                                    }
+                                    available_paths['risk'] = {
+                                        'points': get_final_path_points(risk_label, grid_cells, point_a, point_b, goal_node, grid_spacing),
+                                        'time': risk_label.time,
+                                        'fuel': risk_label.fuel,
+                                        'risk': risk_label.risk
+                                    }
+                                    if optimal_label:
+                                        available_paths['optimal'] = {
+                                            'points': get_final_path_points(optimal_label, grid_cells, point_a, point_b, goal_node, grid_spacing),
+                                            'time': optimal_label.time,
+                                            'fuel': optimal_label.fuel,
+                                            'risk': optimal_label.risk
+                                        }
+                                    else:
+                                        available_paths['optimal'] = None
+
+                                    selected_path_type = 'optimal' if available_paths.get('optimal') else 'time'
                                     animation_progress = 0.0  # Start animation for the first path
                                 else:
-                                    available_paths = {'time': None, 'fuel': None, 'risk': None}
+                                    available_paths = {'time': None, 'fuel': None, 'risk': None, 'optimal': None}
                         elif is_blue_surface(mouse_x, mouse_y):
                             point_a = (mouse_x, mouse_y)
-                            available_paths = {'time': None, 'fuel': None, 'risk': None}
+                            available_paths = {'time': None, 'fuel': None, 'risk': None, 'optimal': None}
                 elif event.button == 3:  # Right click - point B
                     if not points_confirmed:
                         if is_blue_surface(mouse_x, mouse_y):
                             point_b = (mouse_x, mouse_y)
-                            available_paths = {'time': None, 'fuel': None, 'risk': None}
+                            available_paths = {'time': None, 'fuel': None, 'risk': None, 'optimal': None}
+        # region agent log
+        # Log window resize events (if any) to correlate with Matplotlib popups.
+        try:
+            if event.type == pygame.VIDEORESIZE:
+                _dbg_log("A", "main.py:event", "VIDEORESIZE", {"size": getattr(event, "size", None), "w": getattr(event, "w", None), "h": getattr(event, "h", None)})
+            elif hasattr(pygame, "WINDOWEVENT") and event.type == pygame.WINDOWEVENT:
+                _dbg_log(
+                    "A",
+                    "main.py:event",
+                    "WINDOWEVENT",
+                    {"window_event": getattr(event, "event", None), "data1": getattr(event, "data1", None), "data2": getattr(event, "data2", None)},
+                )
+        except Exception:
+            pass
+        # endregion
 
     # Draw background
     if current_page == 1:
@@ -917,7 +1223,7 @@ while running:
         if path_data and path_data['points']:
             path_points = path_data['points']
             # Color map for the paths
-            path_colors = {'time': GREEN, 'fuel': BLUE, 'risk': ORANGE}
+            path_colors = {'time': GREEN, 'fuel': BLUE, 'risk': ORANGE, 'optimal': (160, 60, 220)}
             color = path_colors.get(selected_path_type, BLUE)
             
             # Draw a thick line connecting the path points
@@ -1065,10 +1371,11 @@ while running:
             button_width = 200
             button_height = 45
             button_x = 10
-            button_y_start = height - (button_height + 10) * 3 - 10
+            button_y_start = height - (button_height + 10) * 4 - 10
             
             # Paths labels and types
             paths = [
+                ("Optimal", 'optimal', (160, 60, 220)),
                 ("Fastest", 'time', GREEN),
                 ("Eco-Friendly", 'fuel', BLUE),
                 ("Safest", 'risk', ORANGE)
@@ -1090,7 +1397,9 @@ while running:
                 # Draw label and metrics
                 path_data = available_paths.get(p_type)
                 if path_data:
-                    if p_type == 'time':
+                    if p_type == 'optimal':
+                        metric_text = f"{label}"
+                    elif p_type == 'time':
                         metric_text = f"{label}: {path_data['time']:.1f}h"
                     elif p_type == 'fuel':
                         metric_text = f"{label}: {path_data['fuel']:.1f}T"
@@ -1104,7 +1413,24 @@ while running:
                 screen.blit(text_surf, text_rect)
 
     # Update the display
+    # region agent log
+    try:
+        sizes_now = _get_window_sizes(screen)
+        if _last_sizes is None:
+            _last_sizes = sizes_now
+        elif sizes_now != _last_sizes:
+            _dbg_log("D", "main.py:frame", "pygame size changed", {"before": _last_sizes, "after": sizes_now})
+            _last_sizes = sizes_now
+    except Exception:
+        pass
+    # endregion
     pygame.display.flip()
+    # Keep Matplotlib windows responsive (so you can close them with the X button)
+    if _HAS_MPL:
+        try:
+            plt.pause(0.001)
+        except Exception:
+            pass
     clock.tick(60)  # Maintain 60 FPS for smooth animation
 
 # Quit Pygame
