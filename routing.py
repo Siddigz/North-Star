@@ -85,8 +85,8 @@ def line_of_sight(grid, start, end):
     if dist == 0:
         return True
         
-    # Number of samples based on distance (one sample every 0.5 grid cells for optimized precision)
-    num_samples = int(dist * 2) + 1
+    # Number of samples based on distance (one sample every 0.2 grid cells for high precision)
+    num_samples = int(dist * 5) + 1
     
     ROWS = len(grid)
     COLS = len(grid[0])
@@ -96,14 +96,17 @@ def line_of_sight(grid, start, end):
         curr_r = r0 + (r1 - r0) * t
         curr_c = c0 + (c1 - c0) * t
         
-        # Check center and slightly around for clearance (sampling reduced for speed)
-        check_r = int(round(curr_r))
-        check_c = int(round(curr_c))
-        
-        if not (0 <= check_r < ROWS and 0 <= check_c < COLS):
-            return False
-        if not getattr(grid[check_r][check_c], 'is_clickable', False):
-            return False
+        # Check a small neighborhood around the point for a "fat line" clearance
+        # This ensures the line doesn't just graze land corners
+        for dr in [-0.3, 0.3]:
+            for dc in [-0.3, 0.3]:
+                check_r = int(round(curr_r + dr))
+                check_c = int(round(curr_c + dc))
+                
+                if not (0 <= check_r < ROWS and 0 <= check_c < COLS):
+                    return False
+                if not getattr(grid[check_r][check_c], 'is_clickable', False):
+                    return False
             
     return True
 

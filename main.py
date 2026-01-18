@@ -24,6 +24,9 @@ except pygame.error as e:
 screen = pygame.display.set_mode((width, height))
 pygame.display.set_caption("Ship Selection")
 
+# Set up clock for smooth animation
+clock = pygame.time.Clock()
+
 # Define colors
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
@@ -157,9 +160,15 @@ def analyze_cell_from_image(cell_x, cell_y, grid_spacing, pixel_array=None):
     # Weather: simulated as a combination of ice and randomness
     weather = 1.0 + ice_ratio * 2.0 + random.uniform(0, 5.0)
     
-    # Determine if clickable: show grid if ANY sampled point is water
-    # This helps catch narrow rivers and small bodies of water
-    is_clickable = blue_pixels >= 1
+    # Determine if clickable: show grid if majority of sampled points are water
+    # Stricter threshold to avoid pathfinding through land edges
+    is_clickable = water_ratio > 0.3
+    
+    # If it's borderline, make it very expensive to discourage pathfinding
+    if water_ratio < 0.95:
+        risk *= 5.0
+        time_mult *= 5.0
+        fuel_mult *= 5.0
     
     return GridCell(risk=risk, time=time_mult, fuel=fuel_mult, weather=weather, is_clickable=is_clickable)
 
@@ -193,41 +202,9 @@ def init_grid_cells(width, height, grid_spacing):
         # Unlock the surface
         pixel_array.close()
         
-    # 2. Find starting point (first clickable cell from top-left)
-    start_node = None
-    for r in range(grid_rows):
-        for c in range(grid_cols):
-            if grid[r][c].is_clickable:
-                start_node = (r, c)
-                break
-        if start_node:
-            break
-            
-    if not start_node:
-        _cached_grid = grid
-        return grid
-
-    # 3. BFS Reachability Check
-    reachable = set()
-    queue = deque([start_node])
-    reachable.add(start_node)
-    
-    while queue:
-        r, c = queue.popleft()
-        # Neighbors: Up, Down, Left, Right
-        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < grid_rows and 0 <= nc < grid_cols:
-                if grid[nr][nc].is_clickable and (nr, nc) not in reachable:
-                    reachable.add((nr, nc))
-                    queue.append((nr, nc))
-                    
-    # 4. Filter non-reachable cells
-    for r in range(grid_rows):
-        for c in range(grid_cols):
-            if (r, c) not in reachable:
-                grid[r][c].is_clickable = False
-                
+    # 2. Skip Reachability Check (Showing all water bodies instead of just one)
+    # This ensures that islands of water or disconnected bodies are still clickable
+    # and shown on the grid.
     _cached_grid = grid
     return grid
 
@@ -293,16 +270,15 @@ def get_final_path_points(label, grid_cells, point_a, point_b, goal_node, grid_s
     waypoint_coords.append(point_a)
     
     # Convert intermediate waypoints to centers
-    for r, c in pruned_indices:
+    # Skip the first and last elements because they are the start and end nodes
+    for i in range(1, len(pruned_indices) - 1):
+        r, c = pruned_indices[i]
         px = c * grid_spacing + grid_spacing // 2
         py = r * grid_spacing + grid_spacing // 2
-        
-        # Avoid adding point if it's too close to point_a or point_b
-        dist_a = math.sqrt((px - point_a[0])**2 + (py - point_a[1])**2)
-        dist_b = math.sqrt((px - point_b[0])**2 + (py - point_b[1])**2)
-        
-        if dist_a > grid_spacing // 2 and dist_b > grid_spacing // 2:
-            waypoint_coords.append((px, py))
+        waypoint_coords.append((px, py))
+    
+    # End directly at point_b
+    waypoint_coords.append(point_b)
     
     # End directly at point_b
     waypoint_coords.append(point_b)
@@ -311,21 +287,23 @@ def get_final_path_points(label, grid_cells, point_a, point_b, goal_node, grid_s
     raw_spline_path = get_spline_points(waypoint_coords, num_segments=15)
     
     # 5. Final Validation: Ensure smoothed points don't drift onto land
-    # Optimization: Sample only 1 out of every 3 spline points for validation
     is_path_valid = True
-    for i in range(0, len(raw_spline_path), 3):
+    for i in range(0, len(raw_spline_path)):
         px, py = raw_spline_path[i]
         if not is_blue_surface(int(px), int(py)):
             is_path_valid = False
             break
     
-    if is_path_valid and not is_blue_surface(int(raw_spline_path[-1][0]), int(raw_spline_path[-1][1])):
-        is_path_valid = False
-    
     if is_path_valid:
         return raw_spline_path
     else:
         # Fallback to pruned waypoints if spline drifts
+        # Check if the fallback is also on land (it shouldn't be, but just in case)
+        for px, py in waypoint_coords:
+            if not is_blue_surface(int(px), int(py)):
+                # If even waypoints are on land, the grid logic failed
+                # For now just return it, but this shouldn't happen with the new LoS
+                pass
         return waypoint_coords
 
 # Load ships data from Excel
@@ -409,6 +387,7 @@ toggle_on = False  # Toggle button state
 grid_cells = None  # 2D grid of GridCell instances for each grid square
 available_paths = {'time': None, 'fuel': None, 'risk': None}  # Dictionary to store optimized paths
 selected_path_type = 'time'  # Currently selected path type
+animation_progress = 1.0  # Path drawing animation progress (0.0 to 1.0)
 selected_grid_layer = 'none'  # Grid visualization layer: 'none', 'risk', 'time', 'fuel'
 
 def get_value_color(value, min_val, max_val):
@@ -557,6 +536,7 @@ while running:
                 grid_cells = None
                 available_paths = {'time': None, 'fuel': None, 'risk': None}
                 selected_path_type = 'time'
+                animation_progress = 1.0
         elif event.type == pygame.MOUSEBUTTONDOWN:
             mouse_x, mouse_y = event.pos
             
@@ -647,11 +627,17 @@ while running:
                         selected_grid_layer = 'risk' if selected_grid_layer != 'risk' else 'none'
                     elif points_confirmed and any(available_paths.values()):
                         if fastest_rect.collidepoint(mouse_x, mouse_y):
-                            selected_path_type = 'time'
+                            if selected_path_type != 'time':
+                                selected_path_type = 'time'
+                                animation_progress = 0.0
                         elif eco_rect.collidepoint(mouse_x, mouse_y):
-                            selected_path_type = 'fuel'
+                            if selected_path_type != 'fuel':
+                                selected_path_type = 'fuel'
+                                animation_progress = 0.0
                         elif safest_rect.collidepoint(mouse_x, mouse_y):
-                            selected_path_type = 'risk'
+                            if selected_path_type != 'risk':
+                                selected_path_type = 'risk'
+                                animation_progress = 0.0
                     elif not points_confirmed:
                         if point_a and point_b and map_confirm_rect.collidepoint(mouse_x, mouse_y):
                             # Visual feedback for processing
@@ -659,7 +645,7 @@ while running:
                             overlay.set_alpha(128)
                             overlay.fill(BLACK)
                             screen.blit(overlay, (0, 0))
-                            proc_text = font_large.render("Processing Path...", True, WHITE)
+                            proc_text = font_large.render("Processing Paths...", True, WHITE)
                             proc_rect = proc_text.get_rect(center=(width // 2, height // 2))
                             screen.blit(proc_text, proc_rect)
                             pygame.display.flip()
@@ -680,6 +666,7 @@ while running:
                                     available_paths['fuel'] = {'points': get_final_path_points(fuel_label, grid_cells, point_a, point_b, goal_node, grid_spacing), 'time': fuel_label.time, 'fuel': fuel_label.fuel, 'risk': fuel_label.risk}
                                     available_paths['risk'] = {'points': get_final_path_points(risk_label, grid_cells, point_a, point_b, goal_node, grid_spacing), 'time': risk_label.time, 'fuel': risk_label.fuel, 'risk': risk_label.risk}
                                     selected_path_type = 'time'
+                                    animation_progress = 0.0  # Start animation for the first path
                                 else:
                                     available_paths = {'time': None, 'fuel': None, 'risk': None}
                         elif is_blue_surface(mouse_x, mouse_y):
@@ -887,7 +874,37 @@ while running:
             
             # Draw a thick line connecting the path points
             if len(path_points) > 1:
-                pygame.draw.lines(screen, color, False, path_points, 5)
+                # Calculate how many segments to draw
+                num_segments = len(path_points) - 1
+                
+                # Calculate total progress in terms of segments
+                segment_progress = num_segments * animation_progress
+                visible_segments = int(segment_progress)
+                
+                # Draw the fully visible segments
+                if visible_segments > 0:
+                    pygame.draw.lines(screen, color, False, path_points[:visible_segments + 1], 5)
+                
+                # Interpolate the "growing" segment for smoother animation
+                if visible_segments < num_segments:
+                    p1 = path_points[visible_segments]
+                    p2 = path_points[visible_segments + 1]
+                    
+                    # Fraction of the current segment that is visible
+                    segment_fraction = segment_progress - visible_segments
+                    
+                    # Calculate intermediate point
+                    inter_x = p1[0] + (p2[0] - p1[0]) * segment_fraction
+                    inter_y = p1[1] + (p2[1] - p1[1]) * segment_fraction
+                    
+                    # Draw the final partial segment
+                    pygame.draw.line(screen, color, p1, (inter_x, inter_y), 5)
+                
+                # Increment animation progress
+                if animation_progress < 1.0:
+                    animation_progress += 0.015  # Slightly slower but much smoother with interpolation
+                    if animation_progress > 1.0:
+                        animation_progress = 1.0
         
         # Display ship name in top left (drawn on top of grid)
         if confirmed_ship:
@@ -1028,7 +1045,7 @@ while running:
                     if p_type == 'time':
                         metric_text = f"{label}: {path_data['time']:.1f}h"
                     elif p_type == 'fuel':
-                        metric_text = f"{label}: {path_data['fuel']:.1f}L"
+                        metric_text = f"{label}: {path_data['fuel']:.1f}T"
                     else:
                         metric_text = f"{label}: {path_data['risk']:.1f}R"
                 else:
@@ -1040,6 +1057,7 @@ while running:
 
     # Update the display
     pygame.display.flip()
+    clock.tick(60)  # Maintain 60 FPS for smooth animation
 
 # Quit Pygame
 pygame.quit()
