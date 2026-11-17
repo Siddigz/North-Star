@@ -1,4 +1,4 @@
-# Arctic Ship Routing Optimizer - uOttahack 8
+# Arctic Ship Routing Optimizer - uOttaHack 8
 
 <p align="center">
   <img src="visuals/fastest.png" alt="Fastest route mode screenshot" width="49%" />
@@ -11,7 +11,7 @@
 ## Project Overview
 This project is an advanced ship routing and pathfinding tool designed for navigating the challenging conditions of the Arctic. It utilizes a **Pareto-optimal label-setting algorithm** to calculate multiple route options based on different optimization priorities: **Time**, **Fuel Consumption**, and **Safety (Risk)**.
 
-Developed during **uOttahack 8**, this tool aims to provide maritime navigators with data-driven insights into the most efficient and safest paths through ice-prone waters.
+Developed during **uOttaHack 8**, this tool aims to provide maritime navigators with data-driven insights into the most efficient and safest paths through ice-prone waters.
 
 ## The Team
 This project was developed by:
