@@ -28,6 +28,27 @@ This project was developed by:
 - **Interactive Map Interface**: Set start and end points directly on the map and visualize the optimized routes with smooth animations.
 - **Grid Visualization Layers**: Toggle between different data layers (Risk, Time, Fuel) to understand the underlying environmental costs.
 
+## Walkthrough
+
+**1. Pick a ship.** Each ship's speed, fuel use and durability come from `Ships.xlsx` and change how
+routes are scored.
+
+![Ship selection screen with the Icebreaker selected](docs/ship-select.png)
+
+**2. Set points A and B and get routes.** The router finds the Pareto-optimal set of routes, then
+offers the fastest, the most fuel-efficient, the safest, and a balanced "Optimal" pick.
+
+![The balanced optimal route from the Beaufort Sea to Baffin Bay](docs/route-optimal.png)
+
+**3. See why a route goes where it does.** Grid layers colour every water cell by its time, fuel or
+risk cost. Here the safest route is drawn over the risk layer.
+
+![The safest route over the risk layer, green for low risk and red for high](docs/risk-layer.png)
+
+**4. Compare the numbers.** Clicking a route opens its time, fuel and risk totals.
+
+<p align="center"><img src="docs/route-metrics.png" alt="Bar chart of the optimal route's time, fuel and risk" width="60%" /></p>
+
 ## Technical Stack
 - **Python**: Core logic and algorithm.
 - **Pygame**: Graphical User Interface and map rendering.
